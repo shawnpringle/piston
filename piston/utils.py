@@ -99,7 +99,7 @@ def strfage(time, fmt):
     """ Format time/age
     """
     if not hasattr(time, "days"):  # dirty hack
-        now = datetime.now()
+        now = datetime.utcnow()
         d = datetime.strptime(time, '%Y-%m-%dT%H:%M:%S')
         time = (now - d)
 
@@ -107,12 +107,24 @@ def strfage(time, fmt):
     d["hours"], rem = divmod(time.seconds, 3600)
     d["minutes"], d["seconds"] = divmod(rem, 60)
 
-    s = "{seconds} seconds"
-    if d["minutes"]:
+    
+    if d["seconds"] == 1:
+        s = "{seconds} second"
+    elif d["seconds"] != 0 or (d["minutes"] == d["hours"] == d["days"] == 0):
+        s = "{seconds} seconds"
+    else:
+        s = ""
+    if d["minutes"] == 1:
+        s = "{minutes} minute " + s
+    elif d["minutes"]:
         s = "{minutes} minutes " + s
-    if d["hours"]:
+    if d["hours"] == 1:
+        s = "{hours} hour " + s
+    elif d["hours"]:
         s = "{hours} hours " + s
-    if d["days"]:
+    if d["days"] == 1:
+        s = "{days} day " + s
+    elif d["days"]:
         s = "{days} days " + s
     return s.format(**d)
 
