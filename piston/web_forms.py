@@ -41,7 +41,7 @@ class WifPrivateKey(object):
         self.message = message
 
     def __call__(self, form, field):
-        from steembase import PrivateKey
+        from steembase.account import PrivateKey
         try:
             PrivateKey(field.data)
         except:
@@ -81,7 +81,11 @@ validators = {
 
 class NewPostForm(Form):
     reply = HiddenField()
-    category = TextField("Category", validators['postCategory'])
+    category = TextField(
+        "Tags",
+        validators['postCategory'],
+        render_kw={"id": "tokenfield"},
+    )
     title = TextField("Title", validators['postText'])
     body = TextAreaField('Body', validators['postText'])
     Submit = SubmitField("Post")

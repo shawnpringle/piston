@@ -3,25 +3,25 @@ import json
 import string
 import random
 from steemapi.steemclient import SteemNodeRPC
-from steembase import PrivateKey, PublicKey, Address
+from steembase.account import PrivateKey, PublicKey, Address
 import steembase.transactions as transactions
 from .utils import (
     resolveIdentifier,
     constructIdentifier,
     derivePermlink,
+    formatTimeString
 )
 from .wallet import Wallet
 from .storage import configStorage as config
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 log = logging.getLogger(__name__)
 
-#: Default settings
-if "node" not in config or not config["node"]:
-    config["node"] = "wss://this.piston.rocks/"
-
 prefix = "STM"
 # prefix = "TST"
+
+STEEMIT_100_PERCENT = 10000
+STEEMIT_1_PERCENT = (STEEMIT_100_PERCENT / 100)
 
 
 class AccountExistsException(Exception):
@@ -44,11 +44,6 @@ class Post(object):
             )
         self.steem = steem
         self._patch = False
-
-        # If this 'post' comes from an operation, it might carry a patch
-        if "body" in post and re.match("^@@", post["body"]):
-            self._patched = True
-            self._patch = post["body"]
 
         # Get full Post
         if isinstance(post, str):  # From identifier
@@ -77,6 +72,12 @@ class Post(object):
             raise ValueError("Post expects an identifier or a dict "
                              "with author and permlink!")
 
+        # If this 'post' comes from an operation, it might carry a patch
+        if "body" in post and re.match("^@@", post["body"]):
+            self._patched = True
+            self._patch = post["body"]
+
+        # Parse Times
         parse_times = ["active",
                        "cashout_time",
                        "created",
@@ -98,11 +99,18 @@ class Post(object):
             pass
         post["_tags"] = meta.get("tags", [])
 
+        # Retrieve the root comment
+        self.openingPostIdentifier, self.category = self._getOpeningPost()
+
+        # Total reward
+        post["total_payout_reward"] = "%.3f SBD" % (
+            float(post["total_payout_value"].split(" ")[0]) +
+            float(post["total_pending_payout_value"].split(" ")[0])
+        )
+
         # Store everything as attribute
         for key in post:
             setattr(self, key, post[key])
-
-        self.openingPostIdentifier, self.category = self._getOpeningPost()
 
     def _getOpeningPost(self):
         m = re.match("/([^/]*)/@([^/]*)/([^#]*).*",
@@ -147,7 +155,7 @@ class Post(object):
     def __repr__(self):
         return "<Steem.Post-%s>" % constructIdentifier(self["author"], self["permlink"])
 
-    def get_comments(self, sort="total_payout_value"):
+    def get_comments(self, sort="total_payout_reward"):
         """ Return **first-level** comments of the post.
         """
         post_author, post_permlink = resolveIdentifier(self.identifier)
@@ -156,7 +164,13 @@ class Post(object):
         for post in posts:
             r.append(Post(self.steem, post))
         if sort == "total_payout_value":
-            r = sorted(r, key=lambda x: float(x[sort].split(" ")[0]), reverse=True)
+            r = sorted(r, key=lambda x: float(
+                x["total_payout_value"].split(" ")[0]
+            ), reverse=True)
+        elif sort == "total_payout_reward":
+            r = sorted(r, key=lambda x: float(
+                x["total_payout_reward"].split(" ")[0]
+            ), reverse=True)
         else:
             r = sorted(r, key=lambda x: x[sort])
         return(r)
@@ -338,6 +352,11 @@ class Steem(object):
 
         return tx
 
+    def info(self):
+        """ Returns the global properties
+        """
+        return self.rpc.get_dynamic_global_properties()
+
     def reply(self, identifier, body, title="", author="", meta=None):
         """ Reply to an existing post
 
@@ -492,10 +511,6 @@ class Steem(object):
 
                 piston set default_voter <account>
         """
-
-        STEEMIT_100_PERCENT = 10000
-        STEEMIT_1_PERCENT = (STEEMIT_100_PERCENT / 100)
-
         if not voter:
             if "default_voter" in config:
                 voter = config["default_voter"]
@@ -533,7 +548,7 @@ class Steem(object):
         """ Create new account in Steem
 
             The brainkey/password can be used to recover all generated keys (see
-            `graphenebase.account` for more details.
+            `steembase.account` for more details.
 
             By default, this call will use ``default_author`` to
             register a new name ``account_name`` with all keys being
@@ -598,7 +613,7 @@ class Steem(object):
             raise AccountExistsException
 
         " Generate new keys from password"
-        from graphenebase.account import PasswordKey, PublicKey
+        from steembase.account import PasswordKey, PublicKey
         if password:
             posting_key = PasswordKey(account_name, password, role="posting")
             active_key  = PasswordKey(account_name, password, role="active")
@@ -610,7 +625,7 @@ class Steem(object):
             memo_pubkey    = memo_key.get_public_key()
             posting_privkey = posting_key.get_private_key()
             active_privkey  = active_key.get_private_key()
-            owner_privkey   = owner_key.get_private_key()
+            # owner_privkey   = owner_key.get_private_key()
             memo_privkey    = memo_key.get_private_key()
             # store private keys
             if storekeys:
@@ -786,17 +801,10 @@ class Steem(object):
         return Post(self, self.rpc.get_content(post_author, post_permlink))
 
     def get_recommended(self, user):
-        """ Get recommended posts for user
-
-            :param str user: Show recommendations for this author
+        """ (obsolete) Get recommended posts for user
         """
-        state = self.rpc.get_state("/@%s/recommended" % user)
-        posts = state["accounts"][user].get("recommended", [])
-        r = []
-        for p in posts:
-            post = state["content"][p]
-            r.append(Post(self, post))
-        return r
+        log.critical("get_recommended has been removed from the backend.")
+        return []
 
     def get_blog(self, user):
         """ Get blog posts of a user
@@ -908,9 +916,16 @@ class Steem(object):
         if not account:
             raise ValueError("You need to provide an account")
         a = self.rpc.get_account(account)
+        info = self.rpc.get_dynamic_global_properties()
+        steem_per_mvest = (
+            float(info["total_vesting_fund_steem"].split(" ")[0]) /
+            (float(info["total_vesting_shares"].split(" ")[0]) / 1e6)
+        )
+        vesting_shares_steem = float(a["vesting_shares"].split(" ")[0]) / 1e6 * steem_per_mvest
         return {
             "balance": a["balance"],
             "vesting_shares" : a["vesting_shares"],
+            "vesting_shares_steem" : vesting_shares_steem,
             "sbd_balance": a["sbd_balance"]
         }
 
@@ -922,15 +937,10 @@ class Steem(object):
             :param int limit: limit number of transactions to return
             :param array only_ops: Limit generator by these operations
         """
-        if not only_ops:
-            assert limit <= 100
-            assert end >= limit
-            return self.rpc.get_account_history(account, end, limit)
-        else:
-            r = []
-            for op in self.loop_account_history(account, end, limit, only_ops):
-                r.append(op)
-            return r
+        r = []
+        for op in self.loop_account_history(account, end, limit, only_ops):
+            r.append(op)
+        return r
 
     def loop_account_history(self, account, end=100, limit=100, only_ops=[]):
         """ Returns a generator for individual account transactions
@@ -941,13 +951,20 @@ class Steem(object):
             :param array only_ops: Limit generator by these operations
         """
         cnt = 0
-        while (cnt < limit) and end >= 100:
-            txs = self.get_account_history(account, end, 100)
+        if end < limit:
+            limit = end
+        if limit > 100:
+            _limit = 100
+        else:
+            _limit = limit
+        while (cnt < limit) and end >= limit:
+
+            txs = self.rpc.get_account_history(account, end, _limit)
             for i in txs:
                 if not only_ops or i[1]["op"][0] in only_ops:
                     cnt += 1
                     yield i
-                if cnt >= limit:
+                if cnt > limit:
                     break
             end = txs[0][0] - 1  # new end
 
@@ -958,3 +975,54 @@ class Steem(object):
         """
         for c in self.rpc.stream("comment", *args, **kwargs):
             yield Post(self, c)
+
+    def interest(self, account):
+        """ Caluclate interest for an account
+
+            :param str account: Account name to get interest for
+        """
+        account = self.rpc.get_account(account)
+        last_payment = formatTimeString(account["sbd_last_interest_payment"])
+        next_payment = last_payment + timedelta(days=30)
+        interest_rate = self.info()["sbd_interest_rate"] / 100  # the result is in percent!
+        interest_amount = (interest_rate / 100) * int(
+            int(account["sbd_seconds"]) / (60 * 60 * 24 * 356)
+        ) * 10 ** -3
+
+        return {
+            "interest": interest_amount,
+            "last_payment" : last_payment,
+            "next_payment" : next_payment,
+            "next_payment_duration" : next_payment - datetime.now(),
+            "interest_rate": interest_rate,
+        }
+
+    def set_withdraw_vesting_route(self, to, percentage=100,
+                                   account=None, auto_vest=False):
+        """ Set up a vesting withdraw route. When vesting shares are
+            withdrawn, they will be routed to these accounts based on the
+            specified weights.
+
+            :param str to: Recipient of the vesting withdrawal
+            :param floag percentage: The percent of the withdraw to go
+                to the 'to' account.
+            :param str account: (optional) the vesting account
+            :param bool auto_vest: Set to true if the from account
+                should receive the VESTS as VESTS, or false if it should
+                receive them as STEEM. (defaults to ``False``)
+        """
+        if not account:
+            if "default_account" in config:
+                account = config["default_account"]
+        if not account:
+            raise ValueError("You need to provide an account")
+
+        op = transactions.Set_withdraw_vesting_route(
+            **{"from_account": account,
+               "to_account": to,
+               "percent": int(percentage * STEEMIT_1_PERCENT),
+               "auto_vest": auto_vest
+               }
+        )
+        wif = self.wallet.getActiveKeyForAccount(account)
+        return self.executeOp(op, wif)
